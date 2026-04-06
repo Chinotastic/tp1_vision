@@ -10,8 +10,15 @@ from .features import (
     match_descriptors,
     points_from_matches,
 )
-from .homography import apply_homography, dlt_homography, ransac_homography
-from .visualization import ensure_dir, save_image, save_keypoints, save_matches
+from .homography import apply_homography, compute_reprojection_distances, ransac_homography
+from .visualization import (
+    compose_canvas_outline,
+    ensure_dir,
+    save_image,
+    save_keypoints,
+    save_matches,
+    save_projected_polygon,
+)
 
 
 DEFAULT_CONFIG = {
@@ -72,6 +79,7 @@ def estimate_pair(image1, image2, config):
         num_iters=config["ransac_iters"],
         thresh=config["ransac_thresh"],
     )
+    distances = compute_reprojection_distances(H, pts1, pts2)
 
     return {
         "feat1": feat1,
@@ -81,6 +89,7 @@ def estimate_pair(image1, image2, config):
         "pts2": pts2,
         "H": H,
         "inlier_mask": inlier_mask,
+        "distances": distances,
     }
 
 
@@ -92,16 +101,16 @@ def compute_output_limits(images, homographies):
         warped = apply_homography(corners, H)
         corners_all.append(warped)
 
-    corners_all = np.vstack(corners_all)
-    min_xy = np.floor(corners_all.min(axis=0)).astype(int)
-    max_xy = np.ceil(corners_all.max(axis=0)).astype(int)
+    stacked_corners = np.vstack(corners_all)
+    min_xy = np.floor(stacked_corners.min(axis=0)).astype(int)
+    max_xy = np.ceil(stacked_corners.max(axis=0)).astype(int)
 
     tx = -min_xy[0]
     ty = -min_xy[1]
     T = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
     width = int(max_xy[0] - min_xy[0])
     height = int(max_xy[1] - min_xy[1])
-    return T, (width, height)
+    return T, (width, height), corners_all
 
 
 def blend_images(warped_images, warped_masks, blend_power=1.0):
@@ -136,7 +145,8 @@ def crop_valid_region(image):
 
 
 def build_panorama(images, homographies, config):
-    T, dsize = compute_output_limits(images, homographies)
+    T, dsize, warped_corners = compute_output_limits(images, homographies)
+    shifted_corners = [apply_homography(corners, T) for corners in warped_corners]
 
     warped_images = []
     warped_masks = []
@@ -150,7 +160,11 @@ def build_panorama(images, homographies, config):
 
     panorama = blend_images(warped_images, warped_masks, blend_power=config["blend_power"])
     panorama = crop_valid_region(panorama)
-    return panorama, warped_images
+    return panorama, warped_images, warped_masks, {
+        "translation": T,
+        "canvas_size": dsize,
+        "warped_corners": shifted_corners,
+    }
 
 
 def run_triplet(image_paths, anchor_index=1, output_dir=None, config=None):
@@ -205,16 +219,53 @@ def run_triplet(image_paths, anchor_index=1, output_dir=None, config=None):
                 images[anchor_index],
                 result["feat2"]["keypoints"],
                 result["matches"],
-                os.path.join(output_dir, f"matches_{idx}_{anchor_index}.png"),
+                os.path.join(output_dir, f"matches_all_{idx}_{anchor_index}.png"),
                 f"Matches {idx}->{anchor_index}",
+            )
+            save_matches(
+                images[idx],
+                result["feat1"]["keypoints"],
+                images[anchor_index],
+                result["feat2"]["keypoints"],
+                result["matches"],
+                os.path.join(output_dir, f"matches_inliers_{idx}_{anchor_index}.png"),
+                f"Inliers {idx}->{anchor_index}",
                 matches_mask=result["inlier_mask"],
             )
+            outlier_mask = (~result["inlier_mask"]).astype(np.uint8)
+            save_matches(
+                images[idx],
+                result["feat1"]["keypoints"],
+                images[anchor_index],
+                result["feat2"]["keypoints"],
+                result["matches"],
+                os.path.join(output_dir, f"matches_outliers_{idx}_{anchor_index}.png"),
+                f"Outliers {idx}->{anchor_index}",
+                matches_mask=outlier_mask,
+            )
+            save_projected_polygon(
+                images[idx],
+                images[anchor_index],
+                result["H"],
+                os.path.join(output_dir, f"projection_{idx}_{anchor_index}.png"),
+                f"Proyeccion {idx}->{anchor_index}",
+            )
 
-    panorama, warped_images = build_panorama(images, homographies, config)
+    panorama, warped_images, warped_masks, canvas_debug = build_panorama(images, homographies, config)
 
     if output_dir is not None:
         for idx, warped in enumerate(warped_images):
             save_image(warped, os.path.join(output_dir, f"warped_{idx}.png"), f"Warped {idx}")
+            save_image(
+                warped_masks[idx] * 255,
+                os.path.join(output_dir, f"mask_{idx}.png"),
+                f"Mask {idx}",
+            )
+        save_image(
+            compose_canvas_outline(canvas_debug["canvas_size"], canvas_debug["warped_corners"]),
+            os.path.join(output_dir, "canvas_outline.png"),
+            "Canvas outline",
+        )
         save_image(panorama, os.path.join(output_dir, "panorama.png"), "Panorama final")
 
     return {
@@ -222,5 +273,8 @@ def run_triplet(image_paths, anchor_index=1, output_dir=None, config=None):
         "homographies": homographies,
         "pair_results": pair_results,
         "panorama": panorama,
+        "warped_images": warped_images,
+        "warped_masks": warped_masks,
+        "canvas_debug": canvas_debug,
         "config": config,
     }
